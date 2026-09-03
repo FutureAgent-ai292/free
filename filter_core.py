@@ -5,6 +5,8 @@ import re
 import openpyxl
 
 PROJ_RE = re.compile(r'^[A-Za-z]+\d')          # 项目列识别：表头以“字母+数字”开头
+# 表头中提取项目代号的 token 规则（如 C62X-M17 / N66QB（对公）/ N50AB/N51AB / C66TB舱泊一体）
+HEADER_CODE_RE = re.compile(r'[A-Z]{1,3}\d{1,4}[A-Z0-9]*(?:-[A-Z0-9]+)*')
 KEEP_SHEETS = {'需求评审记录', 'A2-基础语音回复', '腾讯视频（新）'}   # 无条件保留的页
 DEL_SHEETS  = {'平台化计划'}                     # 无条件删除的页
 REV_SHEET   = '修订记录'                        # 按项目过滤条目的页
@@ -18,25 +20,47 @@ def normalize(s: str) -> str:
 
 
 def get_project_options(wb: openpyxl.Workbook):
-    """从“修订记录”页“项目”列提取去重后的项目选项（归一化、保持首次出现顺序）。"""
-    ws = wb[REV_SHEET]
-    hdr = [c.value for c in ws[1]]
-    col = next((i for i, h in enumerate(hdr) if h and str(h).strip() == '项目'), None)
-    if col is None:
-        return []
+    """收集工作簿中出现的全部项目字段，供用户勾选：
+        1) “修订记录”页“项目”列的全部取值（含“所有项目”）；
+        2) 各功能页表头中的项目代号列（如 C62X-M17、B20CS、N66QB、B30X 等）。
+    统一去空白归一化并去重，保持首次出现顺序，“所有项目”排在首位。
+    """
     seen, order = set(), []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        v = row[col]
-        if v is None:
+
+    def add(raw):
+        key = normalize(raw)
+        if key and key not in seen:
+            seen.add(key)
+            order.append(key)
+
+    # 1) 修订记录 项目列
+    if REV_SHEET in wb.sheetnames:
+        ws = wb[REV_SHEET]
+        hdr = [c.value for c in ws[1]]
+        col = next((i for i, h in enumerate(hdr) if h and str(h).strip() == '项目'), None)
+        if col is not None:
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                v = row[col]
+                if v is None:
+                    continue
+                for part in str(v).replace('\n', '|').split('|'):
+                    if part.strip():
+                        add(part.strip())
+
+    # 2) 各功能页“项目列”的表头（提取项目代号 token，避开表头行中的备注文字）
+    for name in wb.sheetnames:
+        ws = wb[name]
+        hrow = find_header_row(ws)
+        if not hrow:
             continue
-        for part in str(v).replace('\n', '|').split('|'):
-            p = part.strip()
-            if not p:
-                continue
-            key = normalize(p)          # 去空格归一化，合并“B60VS- F03”/“B60VS-F03”等写法
-            if key and key not in seen:
-                seen.add(key)
-                order.append(key)       # 展示与匹配统一使用归一化后的编码
+        for (c0, c1, header) in project_column_groups(ws, hrow):
+            for tok in HEADER_CODE_RE.findall(normalize(str(header))):
+                add(tok)
+
+    # “所有项目”排首位
+    if '所有项目' in order:
+        order.remove('所有项目')
+        order.insert(0, '所有项目')
     return order
 
 
