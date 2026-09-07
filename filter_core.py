@@ -174,6 +174,11 @@ def process_workbook(wb, selected_projects: list):
                 if rng.min_col <= c1 and rng.max_col >= c0:
                     ws.unmerge_cells(str(rng))
             ws.delete_cols(c0, c1 - c0 + 1)
+
+    # 所有保留页：恢复隐藏列可见（避免保留的项目列在输出中仍处于隐藏状态、用户看不到）
+    for name in wb.sheetnames:
+        for dim in wb[name].column_dimensions.values():
+            dim.hidden = False
     return wb
 
 
