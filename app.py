@@ -6,7 +6,9 @@
     streamlit run app.py
 
 流程：
-    1. 上传 xlsx 文件，或输入在线 xlsx 文档链接（只读处理，不会修改原文档）；
+    1. 上传 xlsx 文件，或输入在线文档链接（只读处理，不会修改原文档）；
+       在线链接支持：可直接下载的 xlsx 链接、Google Sheets 链接
+       （自动转换为官方 export 直链，需链接已设为“知道链接的任何人可查看”）；
     2. 自动读取“修订记录”页“项目”列的全部选项，支持多选项目（“所有项目”不默认勾选）；
     3. 点击“生成处理后的文件”，得到按所选项目筛选后的 xlsx 供下载。
 
@@ -19,12 +21,24 @@
        若某页所有列都不含任一选中具体项目，则删除该页。
 """
 import io
+import re
 
 import openpyxl
 import requests
 import streamlit as st
 
 from filter_core import get_project_options, normalize, process_bytes
+
+# Google Sheets 链接 → 官方 export 直链（无需登录，可下载完整 xlsx）
+GOOGLE_SHEET_RE = re.compile(r'docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)')
+
+
+def normalize_url(url: str) -> str:
+    """把 Google Sheets 分享链接改写为可直连下载的 export 链接；其余链接原样返回。"""
+    m = GOOGLE_SHEET_RE.search(url)
+    if m:
+        return f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=xlsx"
+    return url
 
 
 @st.cache_data(show_spinner="正在从链接加载在线文档…")
@@ -35,7 +49,7 @@ def fetch_xlsx(url: str) -> bytes:
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/120.0 Safari/537.36"),
     }
-    resp = requests.get(url, headers=headers, timeout=60)
+    resp = requests.get(normalize_url(url), headers=headers, timeout=60)
     resp.raise_for_status()
     return resp.content
 
@@ -50,10 +64,11 @@ with tab_up:
     uploaded = st.file_uploader("上传 xlsx 文件", type=["xlsx"])
 with tab_url:
     url_input = st.text_input(
-        "输入在线 xlsx 文档链接",
-        placeholder="https://…（可下载的 xlsx / 分享下载链接）",
+        "输入在线文档链接",
+        placeholder="https://…（可下载的 xlsx 直链，或 Google Sheets 分享链接）",
     )
-    st.caption("只读加载并处理后生成新文件，不会改动在线文档内容。")
+    st.caption("只读加载并处理后生成新文件，不会改动在线文档内容。"
+               "Google Sheets 链接需已设置为“知道链接的任何人可查看”。")
 
 raw, src_name = None, "功能清单"
 if uploaded is not None:
