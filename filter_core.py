@@ -4,6 +4,8 @@ import io
 import re
 import openpyxl
 
+from strike_preserve import extract_rich_cells, restore_rich_text
+
 PROJ_RE = re.compile(r'^[A-Za-z]+\d')          # 项目列识别：表头以“字母+数字”开头
 # 表头中提取项目代号的 token 规则（如 C62X-M17 / N66QB（对公）/ N50AB/N51AB / C66TB舱泊一体）
 HEADER_CODE_RE = re.compile(r'[A-Z]{1,3}\d{1,4}[A-Z0-9]*(?:-[A-Z0-9]+)*')
@@ -109,15 +111,19 @@ def project_column_groups(ws, hrow: int):
 
 
 def filter_rows_by_project(wb, sheet_name: str, selected_set):
-    """按“项目”列过滤行：仅保留“项目”∈ 选中项目集合的条目（用于修订记录及纵向项目页）。"""
+    """按“项目”列过滤行：仅保留“项目”∈ 选中项目集合的条目（用于修订记录及纵向项目页）。
+
+    返回被删除行的原始行号列表（供富文本删除线回写时做坐标映射）。
+    """
     ws = wb[sheet_name]
     hdr = [c.value for c in ws[1]]
     col = next((i for i, h in enumerate(hdr) if h and str(h).strip() == '项目'), None)
     if col is None:
-        return
+        return []
     norm_set = {normalize(s) for s in selected_set if s}
     if not norm_set:
-        return
+        return []
+    deleted = []
     for r in range(ws.max_row, 1, -1):
         v = ws.cell(row=r, column=col + 1).value
         keep = False
@@ -126,9 +132,11 @@ def filter_rows_by_project(wb, sheet_name: str, selected_set):
             keep = any(s in nv for s in norm_set)
         if not keep:
             ws.delete_rows(r)
+            deleted.append(r)
+    return deleted
 
 
-def process_workbook(wb, selected_projects: list):
+def process_workbook(wb, selected_projects: list, trace: dict = None):
     """按所选“项目”（可多选）处理工作簿（就地修改）。返回 wb。
 
     规则：
@@ -137,9 +145,14 @@ def process_workbook(wb, selected_projects: list):
       3) “修订记录”及纵向项目页（附录6）只保留“项目”∈ 所选项目的条目；
       4) 其余每页：保留非项目列 + 所有选中具体项目对应的项目列，删除其他项目列；
          若某页所有列都不含任一选中具体项目，则删除该页。
+
+    trace（可选）：记录每页的筛选动作，供富文本删除线回写时做坐标映射：
+        {页名: {'deleted': True} 或 {'cols': [(c0, c1), ...], 'rows': [行号, ...]}}
     """
     for name in DEL_SHEETS:
         if name in wb.sheetnames:
+            if trace is not None:
+                trace[name] = {'deleted': True}
             del wb[name]
 
     specifics = [p for p in selected_projects if normalize(p) != '所有项目']
@@ -147,7 +160,9 @@ def process_workbook(wb, selected_projects: list):
     # 行过滤类页：修订记录 + 纵向项目页
     for name in [REV_SHEET] + sorted(ROW_FILTER_SHEETS):
         if name in wb.sheetnames:
-            filter_rows_by_project(wb, name, selected_projects)
+            deleted_rows = filter_rows_by_project(wb, name, selected_projects)
+            if trace is not None and deleted_rows:
+                trace.setdefault(name, {})['rows'] = deleted_rows
 
     # 列过滤类页
     for name in list(wb.sheetnames):
@@ -158,18 +173,24 @@ def process_workbook(wb, selected_projects: list):
         if hrow == 0 or not specifics:
             # 无项目列 / 未选具体项目：不满足“含所选具体项目列” → 删除该页
             if hrow == 0 and specifics:
+                if trace is not None:
+                    trace[name] = {'deleted': True}
                 del wb[name]
             continue
         groups = project_column_groups(ws, hrow)
         keep_groups = [g for g in groups
                        if any(header_matches(g[2], s) for s in specifics)]
         if not keep_groups:
+            if trace is not None:
+                trace[name] = {'deleted': True}
             del wb[name]                       # 所有列都不含任一选中项目 → 删页
             continue
         # 从右往左删除非所选项目列组，避免列号漂移；
         # 删除前先清除与待删列相交的合并单元格定义（openpyxl 的 delete_cols 不会清理它们）
-        for c0, c1, _ in sorted((g for g in groups if g not in keep_groups),
-                                key=lambda g: g[0], reverse=True):
+        del_groups = [g for g in groups if g not in keep_groups]
+        if trace is not None:
+            trace[name] = {'cols': [(g[0], g[1]) for g in del_groups]}
+        for c0, c1, _ in sorted(del_groups, key=lambda g: g[0], reverse=True):
             for rng in list(ws.merged_cells.ranges):
                 if rng.min_col <= c1 and rng.max_col >= c0:
                     ws.unmerge_cells(str(rng))
@@ -183,9 +204,21 @@ def process_workbook(wb, selected_projects: list):
 
 
 def process_bytes(data: bytes, selected_projects: list) -> bytes:
-    """从字节流读入、处理后输出字节流（供 Web 上传/在线链接使用）。"""
+    """从字节流读入、处理后输出字节流（供 Web 上传/在线链接使用）。
+
+    处理前先提取原始 xlsx 的富文本（删除线）信息，处理后按坐标映射回写，
+    保证输出文件里的删除线等 run 级格式不丢失。
+    """
+    rich = extract_rich_cells(data)
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
-    process_workbook(wb, selected_projects)
+    trace = {}
+    process_workbook(wb, selected_projects, trace)
+    # 给所有存活页补齐 trace 条目（即使无删行删列也要回写富文本）
+    for name in wb.sheetnames:
+        trace.setdefault(name, {})
     out = io.BytesIO()
     wb.save(out)
-    return out.getvalue()
+    result = out.getvalue()
+    if rich:
+        result = restore_rich_text(result, rich, trace)
+    return result
