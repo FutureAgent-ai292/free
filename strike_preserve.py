@@ -54,11 +54,15 @@ def _parse_sheet_map(z: zipfile.ZipFile) -> dict:
 
 
 def _clean_fragment(frag: str) -> str:
-    """去掉 ET 序列化时可能加的命名空间前缀与声明，让片段直接嵌入 worksheet。"""
-    frag = re.sub(r'\sxmlns:ns\d+="[^"]*"', "", frag)
-    frag = re.sub(r'</ns\d+:', "</", frag)          # 闭合标签：</ns0:rPr> -> </rPr>
-    frag = re.sub(r'<ns\d+:', "<", frag)            # 开标签：<ns0:rPr> -> <rPr>
-    frag = re.sub(r'\sxmlns="[^"]*"', "", frag)
+    """把 ET 序列化出来的 rPr 片段规范化为无前缀形式，直接嵌入 worksheet。
+
+    不同 Python/ElementTree 版本序列化子树时可能用 ns0: 或文档里已有的
+    前缀（如 s:）。这里去掉所有 xmlns 声明、去掉所有标签前缀，使片段内元素
+    统一回落到 worksheet 根的默认命名空间。
+    """
+    frag = re.sub(r'\sxmlns(:[\w.]+)?="[^"]*"', "", frag)   # 所有 xmlns 声明
+    frag = re.sub(r'</[\w.]+:', "</", frag)                  # 闭合标签：</s:rPr> -> </rPr>
+    frag = re.sub(r'<[\w.]+:', "<", frag)                   # 开标签：<s:rPr> -> <rPr>
     return frag
 
 
@@ -163,18 +167,41 @@ def _map_ref(ref: str, del_cols, del_rows) -> str or None:
 
 
 # ---------------------------------------------------------------- 回写
-def _replace_cell(xml_text: str, ref: str, new_el: str) -> str:
-    """把 sheet XML 中 r=ref 的 <c> 元素整体替换为 new_el（保留 s/cm/vm/ph 属性）。"""
-    head_pat = re.compile(r'<c\b[^>]*\br="%s"[^>]*>' % re.escape(ref))
+def _replace_cell(xml_text: str, ref: str, new_el: str) -> str or None:
+    """把 sheet XML 中 r=ref 的 <c> 元素整体替换为 new_el。
+
+    关键：必须正确区分两种单元格：
+      - 内容单元格：<c ...>...</c> → 找到它自己的 </c>；
+      - 自闭合空单元格：<c ... /> → 只替换开标签本身，绝不能向后找 </c>
+        （否则会把后面的单元格、甚至 </row><row> 边界一并吞掉，造成重复引用）。
+    """
+    head_pat = re.compile(r'<c\b[^>]*\br="%s"[^>]*?(/?)>' % re.escape(ref))
     m = head_pat.search(xml_text)
     if not m:
         return None
     start = m.start()
-    end = xml_text.find("</c>", m.end())
-    if end == -1:
-        return None
-    end += len("</c>")
+    if m.group(1) == "/":                 # 自闭合 <c ... />：整体就是开标签
+        end = m.end()
+    else:                                 # 内容单元格：到它自己的 </c>
+        end = xml_text.find("</c>", m.end())
+        if end == -1:
+            return None
+        end += len("</c>")
     return xml_text[:start] + new_el + xml_text[end:]
+
+
+def _sheet_structurally_valid(xml_text: str) -> bool:
+    """校验每个 <row> 内单元格引用无重复、列序单调递增（Excel 严格要求）。"""
+    from openpyxl.utils.cell import column_index_from_string
+    for rowm in re.finditer(r'<row\b[^>]*>(.*?)</row>', xml_text, re.S):
+        cols = []
+        for cm in re.finditer(r'<c\b[^>]*\br="([A-Z]+)\d+"', rowm.group(1)):
+            cols.append(column_index_from_string(cm.group(1)))
+        if len(cols) != len(set(cols)):
+            return False
+        if cols != sorted(cols):
+            return False
+    return True
 
 
 def _cell_attrs_to_keep(head: str) -> str:
@@ -235,20 +262,19 @@ def restore_rich_text(out_bytes: bytes, rich_cells: dict, trace: dict) -> bytes:
                 data = zin.read(item.filename)
                 if item.filename in patches:
                     xml_text = data.decode("utf-8")
-                    changed = False
+                    patched = xml_text
                     for ref, runs in patches[item.filename].items():
-                        head_pat = re.compile(r'<c\b[^>]*\br="%s"[^>]*>' % re.escape(ref))
-                        m = head_pat.search(xml_text)
+                        head_pat = re.compile(r'<c\b[^>]*\br="%s"[^>]*?(/?)>' % re.escape(ref))
+                        m = head_pat.search(patched)
                         if not m:
                             continue
                         attrs = _cell_attrs_to_keep(m.group(0))
                         new_el = _build_cell(ref, attrs, runs)
-                        replaced = _replace_cell(xml_text, ref, new_el)
-                        if replaced is None:
-                            continue
-                        xml_text = replaced
-                        changed = True
-                    if changed:
-                        data = xml_text.encode("utf-8")
+                        replaced = _replace_cell(patched, ref, new_el)
+                        if replaced is not None:
+                            patched = replaced
+                    # 结构校验：若回写破坏了行内引用唯一性/顺序，放弃该页回写
+                    if patched != xml_text and _sheet_structurally_valid(patched):
+                        data = patched.encode("utf-8")
                 zout.writestr(item, data)
         return out.getvalue()
